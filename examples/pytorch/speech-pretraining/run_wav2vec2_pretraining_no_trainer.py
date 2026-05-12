@@ -42,6 +42,57 @@ from torch.utils.data.dataloader import DataLoader
 from tqdm.auto import tqdm
 
 import transformers
+import pickle
+import dill
+import datasets.utils._dill
+
+# 1. Directly overwrite Hugging Face's custom _batch_setitems to completely bypass
+# its internal hardcoded call to dill.Pickler._batch_setitems(self, items) missing 'obj'.
+def custom_ds_batch_setitems(self, items, obj=None):
+    try:
+        items = sorted(items)
+    except Exception:
+        try:
+            from datasets.fingerprint import Hasher
+            items = sorted(items, key=lambda x: Hasher.hash(x[0]))
+        except Exception:
+            pass
+    # Invoke underlying implementation on the pure Python Pickler class directly supporting Python 3.14 signature
+    try:
+        if hasattr(pickle, "_Pickler") and hasattr(pickle._Pickler, "_batch_setitems"):
+            try:
+                return pickle._Pickler._batch_setitems(self, items, obj)
+            except TypeError:
+                return pickle._Pickler._batch_setitems(self, items)
+    except Exception:
+        pass
+    # Universal robust fallback using standard public Pickler methods directly
+    for k, v in items:
+        self.save(k)
+        self.save(v)
+        self.write(pickle.SETITEM)
+
+datasets.utils._dill.Pickler._batch_setitems = custom_ds_batch_setitems
+
+# 2. Safely wrap standard pickle._Pickler batch methods if any other code calls them without obj
+if hasattr(pickle, "_Pickler"):
+    if hasattr(pickle._Pickler, "_batch_setitems"):
+        _orig_pkl_setitems = getattr(pickle._Pickler, "_batch_setitems")
+        def safe_pkl_setitems(self, items, obj=None):
+            try:
+                return _orig_pkl_setitems(self, items, obj)
+            except TypeError:
+                return _orig_pkl_setitems(self, items)
+        pickle._Pickler._batch_setitems = safe_pkl_setitems
+
+    if hasattr(pickle._Pickler, "_batch_appends"):
+        _orig_pkl_appends = getattr(pickle._Pickler, "_batch_appends")
+        def safe_pkl_appends(self, items, obj=None):
+            try:
+                return _orig_pkl_appends(self, items, obj)
+            except TypeError:
+                return _orig_pkl_appends(self, items)
+        pickle._Pickler._batch_appends = safe_pkl_appends
 from transformers import (
     SchedulerType,
     Wav2Vec2Config,
@@ -64,6 +115,18 @@ def parse_args():
         type=str,
         default=None,
         help="The name of the dataset to use (via the datasets library).",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="The directory of the dataset to use (passed as data_dir to load_dataset).",
+    )
+    parser.add_argument(
+        "--data_files",
+        type=str,
+        default=None,
+        help="Path or glob pattern of the data files to use (passed as data_files to load_dataset).",
     )
     parser.add_argument(
         "--dataset_config_names",
@@ -453,14 +516,24 @@ def main():
     # ``args.dataset_config_names`` and ``args.dataset_split_names``
     datasets_splits = []
     for dataset_config_name, train_split_name in zip(args.dataset_config_names, args.dataset_split_names):
-        # load dataset
+        load_kwargs = {
+            "cache_dir": args.cache_dir,
+            "trust_remote_code": args.trust_remote_code,
+        }
+        if args.dataset_dir is not None:
+            load_kwargs["data_dir"] = args.dataset_dir
+        if args.data_files is not None:
+            import glob
+            resolved_files = sorted(glob.glob(args.data_files))
+            if not resolved_files:
+                resolved_files = sorted(glob.glob(args.data_files.replace("/", os.sep)))
+            load_kwargs["data_files"] = {train_split_name: resolved_files if resolved_files else args.data_files}
+
         dataset_split = load_dataset(
             args.dataset_name,
             dataset_config_name,
             split=train_split_name,
-            cache_dir=args.cache_dir,
-            trust_remote_code=args.trust_remote_code,
-            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=60 * 60)}},
+            **load_kwargs,
         )
         datasets_splits.append(dataset_split)
 
@@ -505,7 +578,12 @@ def main():
     max_length = int(args.max_duration_in_seconds * feature_extractor.sampling_rate)
     min_length = int(args.min_duration_in_seconds * feature_extractor.sampling_rate)
 
+    _sample_count = [0]
     def prepare_dataset(batch):
+        _sample_count[0] += 1
+        if _sample_count[0] % 50 == 1 or _sample_count[0] < 5:
+            print(f"--> Preprocessing audio sample {_sample_count[0]}...", flush=True)
+
         sample = batch[args.audio_column_name]
 
         inputs = feature_extractor(
@@ -523,11 +601,17 @@ def main():
 
     # load audio files into numpy arrays
     with accelerator.main_process_first():
+        # Multiprocessing dataset.map using spawn on Windows often hangs silently during IPC unpickling.
+        # Running synchronously in the main process avoids serialization deadlocks and completes reliably.
+        if os.name == "nt":
+            args.preprocessing_num_workers = None
+
         vectorized_datasets = raw_datasets.map(
             prepare_dataset,
             num_proc=args.preprocessing_num_workers,
             remove_columns=raw_datasets["train"].column_names,
             cache_file_names=cache_file_names,
+            load_from_cache_file=False,
         )
 
         if min_length > 0.0:
@@ -535,6 +619,7 @@ def main():
                 lambda x: x > min_length,
                 num_proc=args.preprocessing_num_workers,
                 input_columns=["input_length"],
+                load_from_cache_file=False,
             )
 
         vectorized_datasets = vectorized_datasets.remove_columns("input_length")
